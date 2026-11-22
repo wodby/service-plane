@@ -1,0 +1,487 @@
+name: plane
+type: service
+icon: plane
+title: Plane
+scalable: true
+guidance: GUIDANCE.md
+
+labels:
+- plane
+
+# Every component runs the same Plane release.
+options:
+- version: '1'
+  default: true
+  tag: v1.5.0
+
+# The proxy is the only public port: it routes Plane's paths and the storage
+# bucket to the other components.
+endpoints:
+- name: plane
+  ports:
+  - name: http
+    number: 8080
+    protocol: http
+    main: true
+    routeDefaults:
+      https_redirect: 'true'
+      # Pages edited together keep a WebSocket open on /live.
+      request_timeout: 0s
+      backend_request_timeout: 0s
+
+links:
+- name: db
+  title: PostgreSQL
+  required: true
+  env:
+  - name: DATABASE_URL
+    value: '{{link.database.url}}'
+    secret: true
+  selectors:
+  - type: db
+    labels:
+    - postgres
+- name: redis
+  title: Redis
+  required: true
+  env:
+  - name: REDIS_URL
+    value: 'redis://:{{link.tokens.password}}@{{link.host}}:{{link.port}}/0'
+    secret: true
+  selectors:
+  - type: datastore
+    labels:
+    - valkey
+  - type: datastore
+    labels:
+    - redis
+- name: amqp
+  title: RabbitMQ
+  required: true
+  env:
+  # The default vhost "/", URL-encoded as the empty path segment after the
+  # second slash.
+  - name: AMQP_URL
+    value: 'amqp://{{link.tokens.username}}:{{link.tokens.password}}@{{link.host}}:{{link.port}}//'
+    secret: true
+  selectors:
+  - type: service
+    labels:
+    - rabbitmq
+- name: storage
+  title: S3 storage
+  required: true
+  env:
+  - name: AWS_S3_ENDPOINT_URL
+    value: 'http://{{link.host}}:{{link.port}}'
+  - name: AWS_ACCESS_KEY_ID
+    value: '{{link.tokens.access_key}}'
+    secret: true
+  - name: AWS_SECRET_ACCESS_KEY
+    value: '{{link.tokens.secret_key}}'
+    secret: true
+  # The proxy sends the bucket path here, so browsers upload and download
+  # through Plane's own address.
+  - name: PLANE_S3_UPSTREAM
+    value: '{{link.host}}:{{link.port}}'
+  selectors:
+  - type: datastore
+    labels:
+    - s3
+- name: sendmail
+  title: SMTP server
+  required: false
+  env:
+  - name: ENABLE_SMTP
+    value: '1'
+  - name: EMAIL_HOST
+    value: '{{link.host}}'
+  - name: EMAIL_PORT
+    value: '{{link.port}}'
+  # The relay in the cluster accepts mail without TLS.
+  - name: EMAIL_USE_TLS
+    value: '0'
+  - name: EMAIL_USE_SSL
+    value: '0'
+  selectors:
+  - type: service
+    labels:
+    - smtpd
+
+settings:
+# The instance administrator the first deployment sets up, so Plane's setup
+# page at /god-mode is never open to visitors.
+- name: admin-email
+  title: Admin email
+  description: Email address of the Plane instance administrator set up on the first deployment, used to sign in.
+  required: true
+  var: PLANE_ADMIN_EMAIL
+- name: admin-password
+  title: Admin password
+  description: Password of the Plane instance administrator set up on the first deployment. Plane requires a strong one, such as four unrelated words with a number. Change it in Plane afterwards; this setting is not used again.
+  required: true
+  secret: true
+  var: PLANE_ADMIN_PASSWORD
+- name: admin-name
+  title: Admin first name
+  description: First name of the instance administrator.
+  default: Admin
+  var: PLANE_ADMIN_FIRST_NAME
+- name: allow-signup
+  title: Allow sign-up
+  description: Let anyone who can reach Plane create an account (1) or not (0). Applied on the first deployment; change it later in Plane's God Mode.
+  default: '0'
+  var: ENABLE_SIGNUP
+- name: workers
+  title: API workers
+  description: Gunicorn worker processes per API replica.
+  default: '2'
+  var: GUNICORN_WORKERS
+- name: worker-concurrency
+  title: Background worker processes
+  description: Celery processes per worker replica, which send email and run imports, exports and notifications.
+  default: '2'
+  var: PLANE_WORKER_CONCURRENCY
+
+env:
+- name: SECRET_KEY
+  value: '{{secret_key}}'
+  secret: true
+- name: LIVE_SERVER_SECRET_KEY
+  value: '{{live_server_secret_key}}'
+  secret: true
+- name: WEB_URL
+  value: '{{service.primaryURL}}'
+- name: CORS_ALLOWED_ORIGINS
+  value: '{{service.primaryURL}}'
+- name: PLANE_INSTANCE_NAME
+  value: '{{app.title}}'
+- name: EMAIL_FROM
+  value: 'Plane <noreply@{{service.primaryHost}}>'
+- name: DEBUG
+  value: '0'
+# Uploads go to the linked storage through Plane's own address: presigned URLs
+# use the request's host and HTTPS.
+- name: USE_MINIO
+  value: '1'
+- name: MINIO_ENDPOINT_SSL
+  value: '1'
+- name: AWS_REGION
+  value: us-east-1
+- name: AWS_S3_BUCKET_NAME
+  value: uploads
+- name: FILE_SIZE_LIMIT
+  value: '5242880'
+
+tokens:
+- name: secret_key
+  generate:
+    regex: '[a-z0-9]{50}'
+- name: live_server_secret_key
+  generate:
+    regex: '[A-Za-z0-9]{32}'
+
+deployment:
+  strategy: rolling
+  minReady: 10s
+  # A new install applies Plane's migrations, which take several minutes.
+  progressDeadline: 30m
+  shutdownGracePeriod: 30s
+
+helm:
+  name: wodby
+  source: oci://registry-1.docker.io/wodby/plane
+  chart: oci://registry-1.docker.io/wodby/plane
+  version: 0.1.0
+  valueMappings:
+    replicas: replicaCount
+    nameOverride: nameOverride
+    fullnameOverride: fullnameOverride
+    serviceAccountName: serviceAccount.name
+    serviceAccountCreate: serviceAccount.create
+
+workloads:
+- name: proxy
+  kind: deployment
+  primary: true
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: proxy
+  helm:
+    labels: components.proxy.podLabels
+    annotations: components.proxy.podAnnotations
+    volumes: components.proxy.extraVolumes
+    sidecars: components.proxy.sidecars
+    strategy: components.proxy.strategy
+    minReady: components.proxy.minReadySeconds
+    progressDeadline: components.proxy.progressDeadlineSeconds
+    shutdownGracePeriod: components.proxy.terminationGracePeriodSeconds
+  containers:
+  - name: proxy
+    image: makeplane/plane-proxy
+    resources:
+      request:
+        cpu: 10
+        memory: 32
+      limit:
+        cpu: 500
+        memory: 256
+    helm:
+      # Link, setting and integration variables reach only the primary
+      # container, so its env is the chart's shared env that every component
+      # receives.
+      env: env
+      resources: components.proxy.resources
+      mounts: components.proxy.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.proxy.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+- name: web
+  kind: deployment
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: web
+  helm:
+    labels: components.web.podLabels
+    annotations: components.web.podAnnotations
+    volumes: components.web.extraVolumes
+    sidecars: components.web.sidecars
+    strategy: components.web.strategy
+    minReady: components.web.minReadySeconds
+    progressDeadline: components.web.progressDeadlineSeconds
+    shutdownGracePeriod: components.web.terminationGracePeriodSeconds
+  containers:
+  - name: web
+    image: makeplane/plane-frontend
+    resources:
+      request:
+        cpu: 10
+        memory: 32
+      limit:
+        cpu: 500
+        memory: 256
+    helm:
+      env: components.web.env
+      resources: components.web.resources
+      mounts: components.web.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.web.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+- name: admin
+  kind: deployment
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: admin
+  helm:
+    labels: components.admin.podLabels
+    annotations: components.admin.podAnnotations
+    volumes: components.admin.extraVolumes
+    sidecars: components.admin.sidecars
+    strategy: components.admin.strategy
+    minReady: components.admin.minReadySeconds
+    progressDeadline: components.admin.progressDeadlineSeconds
+    shutdownGracePeriod: components.admin.terminationGracePeriodSeconds
+  containers:
+  - name: admin
+    image: makeplane/plane-admin
+    resources:
+      request:
+        cpu: 10
+        memory: 32
+      limit:
+        cpu: 500
+        memory: 256
+    helm:
+      env: components.admin.env
+      resources: components.admin.resources
+      mounts: components.admin.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.admin.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+- name: space
+  kind: deployment
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: space
+  helm:
+    labels: components.space.podLabels
+    annotations: components.space.podAnnotations
+    volumes: components.space.extraVolumes
+    sidecars: components.space.sidecars
+    strategy: components.space.strategy
+    minReady: components.space.minReadySeconds
+    progressDeadline: components.space.progressDeadlineSeconds
+    shutdownGracePeriod: components.space.terminationGracePeriodSeconds
+  containers:
+  - name: space
+    image: makeplane/plane-space
+    resources:
+      request:
+        cpu: 10
+        memory: 128
+      limit:
+        cpu: 1000
+        memory: 512
+    helm:
+      env: components.space.env
+      resources: components.space.resources
+      mounts: components.space.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.space.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+- name: live
+  kind: deployment
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: live
+  helm:
+    labels: components.live.podLabels
+    annotations: components.live.podAnnotations
+    volumes: components.live.extraVolumes
+    sidecars: components.live.sidecars
+    strategy: components.live.strategy
+    minReady: components.live.minReadySeconds
+    progressDeadline: components.live.progressDeadlineSeconds
+    shutdownGracePeriod: components.live.terminationGracePeriodSeconds
+  containers:
+  - name: live
+    image: makeplane/plane-live
+    resources:
+      request:
+        cpu: 10
+        memory: 176
+      limit:
+        cpu: 1000
+        memory: 1024
+    helm:
+      env: components.live.env
+      resources: components.live.resources
+      mounts: components.live.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.live.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+- name: api
+  kind: deployment
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: api
+  helm:
+    labels: components.api.podLabels
+    annotations: components.api.podAnnotations
+    volumes: components.api.extraVolumes
+    sidecars: components.api.sidecars
+    strategy: components.api.strategy
+    minReady: components.api.minReadySeconds
+    progressDeadline: components.api.progressDeadlineSeconds
+    shutdownGracePeriod: components.api.terminationGracePeriodSeconds
+  containers:
+  - name: api
+    image: makeplane/plane-backend
+    resources:
+      request:
+        cpu: 10
+        memory: 256
+      limit:
+        cpu: 2000
+        memory: 2048
+    helm:
+      env: components.api.env
+      resources: components.api.resources
+      mounts: components.api.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.api.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+- name: worker
+  kind: deployment
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: worker
+  helm:
+    labels: components.worker.podLabels
+    annotations: components.worker.podAnnotations
+    volumes: components.worker.extraVolumes
+    sidecars: components.worker.sidecars
+    strategy: components.worker.strategy
+    minReady: components.worker.minReadySeconds
+    progressDeadline: components.worker.progressDeadlineSeconds
+    shutdownGracePeriod: components.worker.terminationGracePeriodSeconds
+  containers:
+  - name: worker
+    image: makeplane/plane-backend
+    resources:
+      request:
+        cpu: 10
+        memory: 384
+      limit:
+        cpu: 2000
+        memory: 2048
+    helm:
+      env: components.worker.env
+      resources: components.worker.resources
+      mounts: components.worker.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.worker.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+# The scheduler pod's init container applies Plane's migrations and sets up the
+# instance administrator on every deploy. The other components wait until
+# the migrations are applied.
+- name: scheduler
+  kind: deployment
+  # Two Celery beat processes must never run at once.
+  deployment:
+    strategy: recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: '{{helm.release}}'
+      app.kubernetes.io/component: scheduler
+  helm:
+    labels: components.scheduler.podLabels
+    annotations: components.scheduler.podAnnotations
+    volumes: components.scheduler.extraVolumes
+    sidecars: components.scheduler.sidecars
+    strategy: components.scheduler.strategy
+    minReady: components.scheduler.minReadySeconds
+    progressDeadline: components.scheduler.progressDeadlineSeconds
+    shutdownGracePeriod: components.scheduler.terminationGracePeriodSeconds
+  containers:
+  - name: scheduler
+    image: makeplane/plane-backend
+    resources:
+      request:
+        cpu: 10
+        memory: 160
+      limit:
+        cpu: 500
+        memory: 512
+    helm:
+      env: components.scheduler.env
+      resources: components.scheduler.resources
+      mounts: components.scheduler.extraVolumeMounts
+      image:
+        registry: image.registry
+        repository: components.scheduler.image.repository
+        tag: image.tag
+        pullPolicy: image.pullPolicy
+
+workspace: false
