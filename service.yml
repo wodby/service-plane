@@ -59,10 +59,10 @@ links:
   title: RabbitMQ
   required: true
   env:
-  # The default vhost "/", URL-encoded as the empty path segment after the
-  # second slash.
+  # The AMQP port: the RabbitMQ service's main port is its management UI.
+  # The default vhost "/" is the empty path segment after the second slash.
   - name: AMQP_URL
-    value: 'amqp://{{link.tokens.username}}:{{link.tokens.password}}@{{link.host}}:{{link.port}}//'
+    value: 'amqp://{{link.tokens.username}}:{{link.tokens.password}}@{{link.host}}:{{link.service.endpoints.rabbitmq.ports.amqp.number}}//'
     secret: true
   selectors:
   - type: service
